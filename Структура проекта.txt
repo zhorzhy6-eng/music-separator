@@ -1,0 +1,88 @@
+E:\Python\AST\
+│
+├── main.py                          # Точка входа
+├── requirements.txt                 # Зависимости
+├── README.md
+├── run.bat                          # Запуск с консолью (отладка)
+├── AST.bat                          # Запуск без консоли (работа)
+│
+├── .venv312\                        # Python 3.12 + CUDA (GPU)
+│   ├── Scripts\
+│   │   ├── python.exe
+│   │   ├── audio-separator.exe      # CLI для BS-Roformer
+│   │   └── ...
+│   └── Lib\site-packages\           # Пакеты: torch-cu121, demucs, muscriptor, audio-separator
+│
+├── .venv\                           # Старый venv (можно удалить)
+│
+├── core\                            # Ядро (Model + Controller)
+│   ├── __init__.py
+│   ├── logging_config.py            # JSON-lines логирование
+│   ├── audio_utils.py               # Чтение, перекодирование FFmpeg
+│   ├── analyzer.py                  # Анализ одного WAV
+│   ├── midi_analyzer.py             # Анализ MIDI
+│   ├── super_analyzer.py            # 🆕 СУПЕР-АНАЛИЗ v4 (Phase Smearing, Spectral Tilt, Transient Loss)
+│   ├── separator.py                 # Demucs (htdemucs, htdemucs_ft) + HPF/Notch
+│   ├── separator_bs.py              # 🆕 BS-Roformer через audio-separator CLI + постобработка
+│   ├── separator_hybrid.py          # 🆕 Гибрид Demucs + BS-Roformer
+│   ├── transcriber.py               # Вокал/минус → MIDI (torchcrepe)
+│   ├── piano_transcriber.py         # Минус → пианино (MuScriptor)
+│   ├── player.py                    # Плеер (sounddevice)
+│   └── worker.py                    # Фоновый воркер (7 типов задач)
+│
+├── ui\                              # Интерфейс (View)
+│   ├── __init__.py
+│   ├── app_window.py                # Главное окно (все кнопки, плеер)
+│   ├── components.py                # DropZone, WaveformView, SeekBar, PlayerBar
+│   └── theme.py                     # Тёмная/светлая темы
+│
+├── assets\                          # Иконки, шрифты
+│   └── icon.ico
+│
+├── config\                          # Настройки пользователя
+│   └── settings.json
+│
+├── models\                          # Веса моделей (скачиваются при 1-м запуске)
+│   └── (пусто — модели качаются в ~/.cache/)
+│
+├── output\                          # Результаты разделения
+│   ├── <имя>_vocals.wav             # Вокал
+│   ├── <имя>_instrumental.wav       # Минус (с постобработкой)
+│   ├── <имя>_vocals.mid             # MIDI вокала (если делал)
+│   ├── <имя>_instrumental.mid       # MIDI минуса (если делал)
+│   ├── <имя>_piano.mid              # Пианино-версия минуса
+│   ├── <имя>_piano_multi.mid        # Промежуточный от MuScriptor
+│   │
+│   ├── _bs_tmp\                     # 🆕 Промежуточные FLAC от audio-separator
+│   │   ├── <имя>_(vocals)_...flac
+│   │   ├── <имя>_(instrumental)_...flac
+│   │   └── ... (bass, drums, guitar, other, piano)
+│   │
+│   ├── _hybrid_demucs\              # 🆕 Промежуточные от Demucs (при гибриде)
+│   │   ├── <имя>_vocals.wav
+│   │   └── <имя>_instrumental.wav
+│   │
+│   └── _hybrid_bs\                  # 🆕 Промежуточные от BS-Roformer (при гибриде)
+│       ├── <имя>_vocals.wav
+│       ├── <имя>_instrumental.wav
+│       └── _bs_tmp\
+│
+└── logs\                            # Логи и отчёты
+    ├── ast.log                      # Основной лог (JSON-lines, ротация 5 МБ × 3)
+    ├── ast.log.1                    # Архив
+    ├── ast.log.2                    # Архив
+    │
+    └── analysis\                    # 🆕 Отчёты анализа
+        ├── <имя>_analysis.json      # Аудио-анализ (уровни, спектр, F0)
+        ├── <имя>_analysis.txt
+        ├── <имя>_waveform.png
+        ├── <имя>_spectrogram.png
+        │
+        ├── <имя>_midi_analysis.json # MIDI-анализ (ноты, октавы)
+        ├── <имя>_midi_analysis.txt
+        │
+        ├── <имя>_super_pair_analysis.json    # 🆕 СУПЕР-АНАЛИЗ v4
+        ├── <имя>_super_pair_analysis.txt     # Человекочитаемый
+        ├── <имя>_super_pair_waveforms.png    # Waveforms: вокал vs минус
+        ├── <имя>_super_pair_envelopes.png    # RMS-огибающие
+        └── <имя>_super_pair_suspicious.png   # 🆕 Карта подозрительных секунд

@@ -1,0 +1,19 @@
+# Нормализация переводов строк: в репозитории — LF
+* text=auto eol=lf
+
+# Windows-скрипты должны остаться с CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Бинарные файлы не трогаем
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.wav binary
+*.flac binary
+*.mid binary
+*.pt binary
+*.pth binary
+*.onnx binary
+*.ckpt binary
