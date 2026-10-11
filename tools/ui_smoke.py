@@ -27,6 +27,16 @@ from ui.theme import DROPZONE_HEIGHT  # noqa: E402
 
 
 def main() -> int:
+    # DECISION: консоль Windows по умолчанию в cp1251 и падает с
+    # UnicodeEncodeError на первом же символе из подписи движка (в названиях
+    # моделей есть «✅»). Проверка при этом падала раньше, чем что-то проверяла.
+    # Переводим вывод в UTF-8: значок лучше, чем потерянная проверка.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     app = AppWindow()
     try:
         app.withdraw()                     # окно не мешает
