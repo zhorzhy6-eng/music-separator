@@ -1,0 +1,10 @@
+{
+  "default_engine": "BS-Roformer: Duality-V2 ✅ баланс",
+  "demucs_device": "cuda",
+  "demucs_shifts": 1,
+  "demucs_overlap": 0.25,
+  "notch_enabled": false,
+  "target_peak": 0.891,
+  "output_sample_rate": 44100,
+  "keep_temp_dirs": false
+}

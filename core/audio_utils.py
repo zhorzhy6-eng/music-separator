@@ -18,9 +18,52 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".flac", ".m4a", ".ogg"}
 
+# Частота, на которой работает весь тракт по умолчанию
+DEFAULT_SAMPLE_RATE = 44100
+
 
 class AudioError(Exception):
     """Базовое исключение для ошибок работы с аудио."""
+
+
+def get_output_sample_rate() -> int:
+    """
+    Частота дискретизации выходных файлов из настроек (output_sample_rate).
+
+    Некорректное значение не ломает тракт: предупреждаем и берём 44100.
+    """
+    from core.config import get_config
+
+    try:
+        value = int(get_config().output_sample_rate)
+    except Exception:
+        logger.warning("Не удалось прочитать output_sample_rate — беру %s",
+                       DEFAULT_SAMPLE_RATE)
+        return DEFAULT_SAMPLE_RATE
+    if not (8000 <= value <= 192000):
+        logger.warning("output_sample_rate=%s вне диапазона 8000..192000 — беру %s",
+                       value, DEFAULT_SAMPLE_RATE)
+        return DEFAULT_SAMPLE_RATE
+    return value
+
+
+def resample_audio(y: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
+    """
+    Пересчитывает сигнал к target_sr. Ось времени — первая (samples, ...).
+
+    Нужна, когда частота вывода в настройках отличается от частоты модели.
+    """
+    if sr == target_sr or y.size == 0:
+        return y
+    from math import gcd
+
+    from scipy.signal import resample_poly
+
+    g = gcd(int(sr), int(target_sr))
+    up, down = target_sr // g, sr // g
+    logger.info("Ресемплинг вывода: %s → %s Гц (up=%s, down=%s)",
+                sr, target_sr, up, down)
+    return resample_poly(y, up, down, axis=0).astype(np.float32)
 
 
 def is_supported(path: str | Path) -> bool:
@@ -98,11 +141,30 @@ def get_audio_info(path: str | Path) -> dict[str, Any]:
         raise AudioError(f"Ошибка чтения файла: {e}") from e
 
 
-def load_mono(path: str | Path, sr: int = 22050):
-    """Загружает аудио в моно (через soundfile, для WAV/FLAC/OGG)."""
+def load_mono(path: str | Path, sr: int | None = None, max_sec: float | None = None):
+    """
+    Загружает аудио в моно (через soundfile, для WAV/FLAC/OGG).
+
+    sr — если задан и отличается от частоты файла, сигнал пересчитывается.
+    Раньше параметр молча игнорировался: функция всегда возвращала родную частоту.
+    """
     y, real_sr = sf.read(str(path), dtype="float32", always_2d=False)
     if y.ndim == 2:
         y = y.mean(axis=1)
+
+    if max_sec is not None:
+        limit = int(max_sec * real_sr)
+        if 0 < limit < len(y):
+            y = y[:limit]
+
+    if sr is not None and sr != real_sr:
+        from scipy.signal import resample_poly
+        from math import gcd
+        g = gcd(int(real_sr), int(sr))
+        y = resample_poly(y, sr // g, real_sr // g).astype(np.float32)
+        logger.info("load_mono: ресемплинг %s → %s Гц", real_sr, sr)
+        real_sr = sr
+
     return y, real_sr
 
 
@@ -117,28 +179,18 @@ def measure_notch_depth(
     sr: int, center_hz: float, q: float, gain_db: float, duration_sec: float = 1.0
 ) -> float:
     """
-    Измеряет ФАКТИЧЕСКУЮ глубину «частичного» notch-фильтра на его центральной частоте.
+    Измеряет ФАКТИЧЕСКОЕ ослабление peaking-EQ на центральной частоте.
 
-    Продовая формула смешивания (см. core/separator.py::_apply_notch и
-    core/separator_bs.py::_postprocess_instrumental) даёт на центре не gain_db,
-    а 20*log10(1 - 10**(gain_db/20)). Эта функция прогоняет синус center_hz
-    через ту же самую формулу и возвращает реальное ослабление в дБ.
+    Сейчас фильтр строится по RBJ biquad (core/dsp.py::peaking_eq_sos), где gain_db —
+    честная глубина, поэтому измерение лишь подтверждает заданное значение.
+    Функция оставлена как самопроверка: если формулу фильтра однажды поменяют,
+    расхождение между заявленным и измеренным будет видно в логе.
 
     Возвращает: ослабление в дБ (отрицательное число).
     Бросает AudioError, если scipy недоступен или частота некорректна.
-
-    ⚠️ ИНВЕРСИЯ ПАРАМЕТРА: gain_db — это НЕ глубина, а параметр смешивания.
-    Чем БЛИЖЕ gain_db к 0, тем ГЛУБЖЕ фактический notch:
-        gain_db =  -1.5 → ≈ -16.0 dB   (текущее значение separator_bs)
-        gain_db =  -3.0 → ≈ -10.7 dB   (текущее значение separator)
-        gain_db =  -6.0 → ≈  -6.0 dB   (мягче)
-        gain_db = -10.0 → ≈  -3.3 dB   (ещё мягче)
-        gain_db = -16.0 → ≈  -1.5 dB
-    Физика оставлена намеренно (аудит P0.1, вариант B): «мягкость» ночта
-    подбирается по этой таблице, а не по величине gain_db.
     """
     try:
-        from scipy.signal import iirnotch, sosfilt, tf2sos
+        from scipy.signal import sosfilt
     except ImportError as e:
         raise AudioError("scipy не установлен — измерение notch невозможно") from e
 
@@ -146,17 +198,15 @@ def measure_notch_depth(
     if center_hz <= 0 or center_hz >= nyq:
         raise AudioError(f"Некорректная частота notch: {center_hz} Гц при sr={sr}")
 
+    # Формула фильтра берётся из общего модуля, чтобы не разъезжаться с продом
+    from core.dsp import peaking_eq_sos
+
     n = max(4096, int(duration_sec * sr))
     t = np.arange(n, dtype=np.float64) / sr
     sig = np.sin(2.0 * math.pi * center_hz * t)
 
-    b, a = iirnotch(center_hz / nyq, q)
-    sos = tf2sos(b, a)
-
-    # ВАЖНО: формула должна совпадать с продовой, иначе цифры будут врать
-    gain_lin = 10.0 ** (gain_db / 20.0)
-    dry = 1.0 - gain_lin
-    out = sosfilt(sos, sig) * gain_lin + sig * dry
+    sos = peaking_eq_sos(sr, center_hz, q, gain_db)
+    out = sosfilt(sos, sig)
 
     skip = n // 4  # отбрасываем переходный процесс фильтра
     rms_in = float(np.sqrt(np.mean(sig[skip:] ** 2)))

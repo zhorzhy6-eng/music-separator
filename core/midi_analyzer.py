@@ -13,6 +13,8 @@ from pathlib import Path
 import numpy as np
 import pretty_midi
 
+from core.utils import json_safe
+
 logger = logging.getLogger(__name__)
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -20,29 +22,6 @@ NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 class MidiAnalysisError(Exception):
     """Ошибка анализа MIDI."""
-
-
-# ============================================================
-#  Универсальный конвертер numpy → Python для JSON
-# ============================================================
-def _json_safe(obj):
-    """
-    Рекурсивно приводит numpy-типы к чистым Python-типам,
-    чтобы json.dumps мог их сериализовать.
-    """
-    if isinstance(obj, dict):
-        return {k: _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_json_safe(v) for v in obj]
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.floating,)):
-        return float(obj)
-    if isinstance(obj, (np.bool_,)):
-        return bool(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    return obj
 
 
 def _note_name(pitch: int) -> str:
@@ -55,6 +34,29 @@ def _note_name(pitch: int) -> str:
 def _octave_label(pitch: int) -> int:
     """MIDI-номер → номер октавы (C4 = 60 → октава 4)."""
     return int(pitch) // 12 - 1
+
+
+def _read_tempo_bpm(path: Path) -> float | None:
+    """
+    Темп из самого MIDI-файла (первое событие set_tempo) или None.
+
+    Специально НЕ используем pretty_midi.estimate_tempo(): он угадывает темп по
+    нотам и выдавал 270 BPM для файла, где темп никто не задавал. А проверка
+    «есть ли темповые события» через pretty_midi бесполезна — она всегда
+    возвращает 120 BPM по умолчанию, даже если событий в файле нет.
+    """
+    try:
+        import mido
+        mid = mido.MidiFile(str(path))
+    except Exception:
+        logger.warning("Не удалось прочитать темповые события из %s", path, exc_info=True)
+        return None
+
+    for track in mid.tracks:
+        for msg in track:
+            if msg.type == "set_tempo" and getattr(msg, "tempo", 0):
+                return round(60000000.0 / msg.tempo, 1)
+    return None
 
 
 # ============================================================
@@ -88,10 +90,9 @@ def analyze_midi(midi_path: str | Path, report_dir: str | Path | None = None) ->
 
     # ---------- Общая инфо ----------
     duration = float(midi.get_end_time())
-    try:
-        tempo = float(midi.estimate_tempo()) if duration > 0 else 120.0
-    except Exception:
-        tempo = 120.0
+    # Темп берём из файла как факт. Если событий нет — честно пишем «не определён»,
+    # а не подставляем угаданное число.
+    tempo = _read_tempo_bpm(p)
     n_instruments = len(midi.instruments)
 
     # ---------- Собираем все ноты ----------
@@ -167,7 +168,7 @@ def analyze_midi(midi_path: str | Path, report_dir: str | Path | None = None) ->
         "file": str(p.resolve()),
         "name": str(p.name),
         "duration_sec": float(round(duration, 2)),
-        "tempo_bpm": float(round(tempo, 1)),
+        "tempo_bpm": tempo if tempo is None else float(round(tempo, 1)),
         "instruments": instruments_info,
         "summary": {
             "total_notes": int(len(all_notes)),
@@ -194,7 +195,7 @@ def analyze_midi(midi_path: str | Path, report_dir: str | Path | None = None) ->
     txt_path = report_dir / f"{base}_midi_analysis.txt"
 
     json_path.write_text(
-        json.dumps(_json_safe(report), ensure_ascii=False, indent=2),
+        json.dumps(json_safe(report), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     txt_path.write_text(_render_text_report(report), encoding="utf-8")
@@ -220,7 +221,10 @@ def _render_text_report(r: dict) -> str:
     lines.append("=" * 60)
     lines.append(f"Время анализа:  {r['analyzed_at']}")
     lines.append(f"Длительность:   {r['duration_sec']} сек")
-    lines.append(f"Темп:           {r['tempo_bpm']} BPM")
+    if r["tempo_bpm"] is None:
+        lines.append("Темп:           не определён (нет темповых событий)")
+    else:
+        lines.append(f"Темп:           {r['tempo_bpm']} BPM")
     lines.append(f"Инструментов:   {len(r['instruments'])}")
     lines.append("")
 

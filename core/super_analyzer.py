@@ -19,10 +19,13 @@ from datetime import datetime
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")
+# force=True: супер-анализ рисует графики в рабочем потоке, GUI-бэкенд тут нельзя
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
+
+from core.utils import json_safe, to_db
 
 logger = logging.getLogger(__name__)
 
@@ -32,14 +35,68 @@ class SuperAnalysisError(Exception):
 
 
 # ============================================================
+#  Порог «вокал активен»
+# ============================================================
+# Раньше было жёстко «медиана + 6 дБ». У вокала с малой динамикой (сжатый стем)
+# этот порог перешагивают единичные кадры: на треке Brutaliti их оказалось 4 из
+# 4792, и все метрики посчитались фактически на 0.2 секунды звука. Теперь порог
+# адаптивный: не ниже 75-го перцентиля, но и не ближе 3 дБ к медиане.
+ACTIVE_MIN_OVER_MEDIAN_DB = 3.0   # активным считаем только заметно громче медианы
+QUIET_UNDER_MEDIAN_DB = 6.0       # «тихий» кадр — на 6 дБ ниже медианы
+ACTIVE_COVERAGE_WARN_PCT = 5.0    # ниже этого покрытия вердикт ненадёжен
+
+# --- Когда измерять нечего ---
+# DECISION: если на вход подан готовый минус, вокал-стем — это почти тишина, и
+# все «метрики качества разделения» считаются от шума: на прогоне 11.10.2026
+# VPI вышел +139.8 дБ (в природе такого не бывает), наклон спектра −65 %,
+# «подозрительных секунд» — 88. Числа выглядели как приговор, хотя измерять
+# было нечего: сравнивать не с чем, когда вокала нет.
+NO_VOCAL_RMS_DB = -45.0      # вокал тише этого — это не вокал, а тишина/шум
+NO_VOCAL_GAP_DB = 30.0       # ...и при этом он хотя бы на столько тише минуса
+# Опорой для сравнения служат «тихие» кадры вокала. На трёх кадрах средние
+# гуляют на десятки дБ, а если в этих кадрах сам минус — ровные нули, разница
+# обращается в бесконечность. Поэтому: минимум кадров и порог «это ещё звук».
+MIN_REFERENCE_FRAMES = 20
+REFERENCE_FLOOR_DB = -120.0
+
+
+def _vocal_activity(v_rms_db: np.ndarray) -> tuple[np.ndarray, np.ndarray, dict]:
+    """
+    Делит кадры вокала на «активные» и «тихие» и считает покрытие.
+
+    Возвращает (маска активных, маска тихих, информация о покрытии).
+    """
+    v_rms_db = np.asarray(v_rms_db, dtype=np.float64)
+    n = int(v_rms_db.size)
+    empty = {
+        "active_frames_total": n, "active_frames_used": 0,
+        "active_coverage_pct": 0.0, "active_threshold_db": None,
+        "vocal_median_db": None,
+    }
+    if n == 0:
+        return np.zeros(0, dtype=bool), np.zeros(0, dtype=bool), empty
+
+    v_median = float(np.median(v_rms_db))
+    v_p75 = float(np.percentile(v_rms_db, 75))
+    threshold = max(v_p75, v_median + ACTIVE_MIN_OVER_MEDIAN_DB)
+
+    active = v_rms_db > threshold
+    quiet = v_rms_db < (v_median - QUIET_UNDER_MEDIAN_DB)
+    used = int(np.sum(active))
+
+    info = {
+        "active_frames_total": n,
+        "active_frames_used": used,
+        "active_coverage_pct": round(100.0 * used / n, 2),
+        "active_threshold_db": round(threshold, 2),
+        "vocal_median_db": round(v_median, 2),
+    }
+    return active, quiet, info
+
+
+# ============================================================
 #  Базовые утилиты
 # ============================================================
-def _to_db(x: float) -> float:
-    if x <= 1e-10:
-        return -200.0
-    return 20.0 * math.log10(x)
-
-
 def _rms(x: np.ndarray) -> float:
     if x.size == 0:
         return 0.0
@@ -97,22 +154,6 @@ def _correlate_1d(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(a, b)[0, 1])
 
 
-def _json_safe(obj):
-    if isinstance(obj, dict):
-        return {k: _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_json_safe(v) for v in obj]
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.floating,)):
-        return float(obj)
-    if isinstance(obj, (np.bool_,)):
-        return bool(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    return obj
-
-
 def _band_energy_db(frame: np.ndarray, sr: int, f_lo: float, f_hi: float) -> float:
     if frame.size < 8:
         return -200.0
@@ -122,7 +163,7 @@ def _band_energy_db(frame: np.ndarray, sr: int, f_lo: float, f_hi: float) -> flo
     if not np.any(mask):
         return -200.0
     energy = float(np.sum(spec[mask]))
-    return _to_db(math.sqrt(energy))
+    return to_db(math.sqrt(energy))
 
 
 # ============================================================
@@ -181,7 +222,12 @@ def _compute_vpi(v_mono, i_mono, sr, frame_sec=0.1) -> dict:
     n = min(len(v_mono), len(i_mono))
     n_frames = max(0, (n - frame_len) // hop)
     if n_frames < 5:
-        return {"vpi_db": 0.0, "voice_band_lo": 1000, "voice_band_hi": 4000}
+        # Слишком короткий файл: VPI не из чего считать. «0.0» здесь означало бы
+        # «отпечатка нет» — уверенное утверждение без единого измерения.
+        return {"voice_band_lo": 1000, "voice_band_hi": 4000,
+                "vpi_note": "файл слишком короткий для сравнения",
+                "active_frames_total": n_frames, "active_frames_used": 0,
+                "active_coverage_pct": 0.0}
     v_band = np.zeros(n_frames)
     i_band = np.zeros(n_frames)
     v_rms_frames = np.zeros(n_frames)
@@ -193,14 +239,37 @@ def _compute_vpi(v_mono, i_mono, sr, frame_sec=0.1) -> dict:
         i_band[k] = _band_energy_db(inf, sr, 1000.0, 4000.0)
         v_rms_frames[k] = _rms(vf)
     v_rms_db = 20 * np.log10(np.maximum(v_rms_frames, 1e-10))
-    v_median = float(np.median(v_rms_db))
-    v_active = v_rms_db > (v_median + 6.0)
-    v_quiet = v_rms_db < (v_median - 6.0)
-    if np.sum(v_active) < 3 or np.sum(v_quiet) < 3:
-        return {"vpi_db": 0.0, "voice_band_lo": 1000, "voice_band_hi": 4000}
+    v_active, v_quiet, coverage = _vocal_activity(v_rms_db)
+    n_active = int(np.sum(v_active))
+    n_quiet = int(np.sum(v_quiet))
+    if n_active < 3 or n_quiet < 3:
+        return {"voice_band_lo": 1000, "voice_band_hi": 4000,
+                "vpi_note": "слишком мало активных или тихих кадров вокала",
+                **coverage}
     i_active_mean = float(np.mean(i_band[v_active]))
     i_quiet_mean = float(np.mean(i_band[v_quiet]))
+    if n_quiet < MIN_REFERENCE_FRAMES or i_quiet_mean <= REFERENCE_FLOOR_DB:
+        # Опора сравнения — тишина, а не музыка: VPI превратился бы в разницу
+        # с математическим нулём (сотни дБ). Честнее не считать вовсе.
+        logger.warning(
+            "VPI не считается: тихих кадров %d (нужно ≥ %d), их уровень %.1f dB "
+            "(порог %.1f) — сравнивать не с чем",
+            n_quiet, MIN_REFERENCE_FRAMES, i_quiet_mean, REFERENCE_FLOOR_DB)
+        return {
+            "voice_band_lo": 1000,
+            "voice_band_hi": 4000,
+            "instrumental_active_band_db": round(i_active_mean, 2),
+            "instrumental_quiet_band_db": round(i_quiet_mean, 2),
+            "active_frames": n_active,
+            "quiet_frames": n_quiet,
+            "vpi_note": (f"тихих кадров вокала всего {n_quiet} — на таком "
+                         f"количестве средние значения недостоверны"),
+            **coverage,
+        }
     vpi_db = i_active_mean - i_quiet_mean
+    logger.info("Покрытие активных кадров (VPI): %.1f%% (%d из %d)",
+                coverage["active_coverage_pct"], coverage["active_frames_used"],
+                coverage["active_frames_total"])
     return {
         "vpi_db": round(vpi_db, 2),
         "voice_band_lo": 1000,
@@ -209,6 +278,7 @@ def _compute_vpi(v_mono, i_mono, sr, frame_sec=0.1) -> dict:
         "instrumental_quiet_band_db": round(i_quiet_mean, 2),
         "active_frames": int(np.sum(v_active)),
         "quiet_frames": int(np.sum(v_quiet)),
+        **coverage,
     }
 
 
@@ -238,7 +308,7 @@ def _phase_smearing(v_mono, i_mono, sr, frame_sec=0.05) -> dict:
         return {"crest_active": 0.0, "crest_quiet": 0.0, "phase_smearing_db": 0.0}
     crest_active = float(np.mean(i_crest[v_active]))
     crest_quiet = float(np.mean(i_crest[v_quiet]))
-    phase_smearing_db = _to_db(crest_active) - _to_db(crest_quiet)
+    phase_smearing_db = to_db(crest_active) - to_db(crest_quiet)
     return {
         "crest_active": round(crest_active, 3),
         "crest_quiet": round(crest_quiet, 3),
@@ -306,30 +376,39 @@ def _transient_loss(v_mono, i_mono, sr, frame_sec=0.02) -> dict:
         inf = i_mono[s:s + frame_len]
         v_rms[k] = _rms(vf)
         spec = np.abs(np.fft.rfft(inf * np.hanning(len(inf))))
+        # Spectral flux: рост спектра ОТ КАДРА К КАДРУ (по времени).
+        # Раньше здесь стоял np.diff(spec) — разница между соседними частотами
+        # внутри одного кадра. Это спектральный наклон, а не транзиенты.
         if prev_spec is not None:
-            diff = np.diff(spec)
-            i_flux[k] = float(np.sum(np.maximum(diff, 0)))
+            i_flux[k] = float(np.sum(np.maximum(spec - prev_spec, 0.0)))
         prev_spec = spec
     v_rms_db = 20 * np.log10(np.maximum(v_rms, 1e-10))
-    v_median = float(np.median(v_rms_db))
-    v_active = v_rms_db > (v_median + 6.0)
-    v_quiet = v_rms_db < (v_median - 6.0)
+    v_active, v_quiet, coverage = _vocal_activity(v_rms_db)
+    # Первый кадр пропускаем: у него нет предыдущего, flux = 0 по определению
+    v_active[0] = False
+    v_quiet[0] = False
     if np.sum(v_active) < 3 or np.sum(v_quiet) < 3:
-        return {"flux_active": 0.0, "flux_quiet": 0.0, "transient_loss_pct": 0.0}
+        return {"flux_active": 0.0, "flux_quiet": 0.0, "transient_loss_pct": 0.0,
+                **coverage}
     flux_active = float(np.mean(i_flux[v_active]))
     flux_quiet = float(np.mean(i_flux[v_quiet]))
     if flux_quiet > 0:
         transient_loss_pct = (flux_active - flux_quiet) / flux_quiet * 100.0
     else:
         transient_loss_pct = 0.0
+    logger.info("Покрытие активных кадров (transient): %.1f%% (%d из %d)",
+                coverage["active_coverage_pct"], coverage["active_frames_used"],
+                coverage["active_frames_total"])
     return {
         "flux_active": round(flux_active, 4),
         "flux_quiet": round(flux_quiet, 4),
         "transient_loss_pct": round(transient_loss_pct, 2),
+        **coverage,
     }
 
 
-def _spectral_difference_per_second(v_mono, i_mono, sr) -> list[dict]:
+def _spectral_difference_per_second(v_mono, i_mono, sr) -> tuple[list[dict], dict]:
+    """Посекундный разбор. Возвращает (список секунд, информация о покрытии)."""
     n = min(len(v_mono), len(i_mono))
     v_mono = v_mono[:n]
     i_mono = i_mono[:n]
@@ -349,9 +428,7 @@ def _spectral_difference_per_second(v_mono, i_mono, sr) -> list[dict]:
         i_centroid[k] = _spectral_centroid(inf, sr)
         i_crest[k] = _crest_factor(inf)
     v_rms_db = 20 * np.log10(np.maximum(v_rms, 1e-10))
-    v_median = float(np.median(v_rms_db))
-    v_active = v_rms_db > (v_median + 6.0)
-    v_quiet = v_rms_db < (v_median - 6.0)
+    v_active, v_quiet, coverage = _vocal_activity(v_rms_db)
     if np.sum(v_quiet) >= 3:
         band_ref = float(np.mean(i_band_1_4k[v_quiet]))
         cent_ref = float(np.mean(i_centroid[v_quiet]))
@@ -379,7 +456,13 @@ def _spectral_difference_per_second(v_mono, i_mono, sr) -> list[dict]:
             "crest_delta_pct": round((crest_sec - crest_ref) / crest_ref * 100.0, 2) if crest_ref > 0 else 0.0,
             "v_active_pct": round(float(np.mean(va)) * 100.0, 1),
         })
-    return result
+    coverage["seconds_analyzed"] = len(result)
+    coverage["seconds_total"] = int(n_sec)
+    logger.info("Покрытие активных кадров (посекундно): %.1f%% (%d из %d), "
+                "секунд разобрано %d из %d",
+                coverage["active_coverage_pct"], coverage["active_frames_used"],
+                coverage["active_frames_total"], len(result), n_sec)
+    return result, coverage
 
 
 # ============================================================
@@ -430,10 +513,10 @@ def super_analyze_pair(vocals_path, instrumental_path,
     i_peak = float(np.max(np.abs(i_mono))) if n else 0.0
     v_rms = _rms(v_mono)
     i_rms = _rms(i_mono)
-    v_rms_db = _to_db(v_rms)
-    i_rms_db = _to_db(i_rms)
-    v_peak_db = _to_db(v_peak)
-    i_peak_db = _to_db(i_peak)
+    v_rms_db = to_db(v_rms)
+    i_rms_db = to_db(i_rms)
+    v_peak_db = to_db(v_peak)
+    i_peak_db = to_db(i_peak)
     v_crest = _crest_factor(v_mono)
     i_crest = _crest_factor(i_mono)
     v_lufs = _approx_lufs(v_rms_db)
@@ -472,7 +555,7 @@ def super_analyze_pair(vocals_path, instrumental_path,
 
     if progress_cb:
         progress_cb(0.78, "Посекундный анализ")
-    per_sec = _spectral_difference_per_second(v_mono, i_mono, sr)
+    per_sec, per_sec_coverage = _spectral_difference_per_second(v_mono, i_mono, sr)
 
     # ---------- УМНАЯ ФИЛЬТРАЦИЯ ----------
     suspicious_seconds = []
@@ -532,10 +615,20 @@ def super_analyze_pair(vocals_path, instrumental_path,
     if progress_cb:
         progress_cb(0.95, "Вердикт")
 
+    # Есть ли в треке вокал вообще. Если вокал-стем — почти тишина (например, на
+    # вход подали готовый минус), судить о качестве разделения не по чему.
+    vocal_present = not (v_rms_db < NO_VOCAL_RMS_DB
+                         and v_rms_db < i_rms_db - NO_VOCAL_GAP_DB)
+    if not vocal_present:
+        logger.warning(
+            "Вокал в треке практически отсутствует (RMS %.1f dBFS против %.1f dBFS "
+            "у минуса) — метрики разделения не имеют смысла",
+            v_rms_db, i_rms_db)
+
     verdict = _make_verdict_v4(
         v_rms_db, i_rms_db, env_corr, bleed_info, vpi_info,
         phase_info, tilt_info, transient_info,
-        real_artifacts, events,
+        real_artifacts, events, vocal_present=vocal_present,
     )
 
     report = {
@@ -577,6 +670,17 @@ def super_analyze_pair(vocals_path, instrumental_path,
             "items": events[:50],
         },
 
+        # Насколько метрикам можно верить: какая доля кадров с вокалом реально
+        # попала в расчёт. Раньше это нигде не показывалось, и вердикт мог
+        # звучать уверенно, будучи посчитанным на долях секунды.
+        "coverage": {
+            "vpi": {k: v for k, v in vpi_info.items() if k.startswith("active_")},
+            "transient": {k: v for k, v in transient_info.items()
+                          if k.startswith("active_")},
+            "per_second": per_sec_coverage,
+            "coverage_warn_pct": ACTIVE_COVERAGE_WARN_PCT,
+        },
+
         "verdict": verdict,
 
         "artifacts": {
@@ -590,7 +694,7 @@ def super_analyze_pair(vocals_path, instrumental_path,
     txt_path = report_dir / f"{base}_super_pair_analysis.txt"
 
     json_path.write_text(
-        json.dumps(_json_safe(report), ensure_ascii=False, indent=2),
+        json.dumps(json_safe(report), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     txt_path.write_text(_render_text_v4(report), encoding="utf-8")
@@ -614,9 +718,45 @@ def super_analyze_pair(vocals_path, instrumental_path,
 #  Вердикт
 # ============================================================
 def _make_verdict_v4(v_rms_db, i_rms_db, env_corr, bleed, vpi, phase, tilt,
-                     transient, real_artifacts, events) -> dict:
+                     transient, real_artifacts, events, vocal_present=True) -> dict:
     kid = []
     pro = []
+
+    # Вокала в треке нет — говорить о качестве разделения нечего. Без этой ветки
+    # вердикт уверенно сообщал «голосовой отпечаток заметен (VPI 139.8 dB)» на
+    # минусовке, где вокал-стем — тишина.
+    if not vocal_present:
+        kid.append(
+            f"ℹ️ В этом треке вокала практически нет: его уровень {v_rms_db:.1f} dBFS, "
+            f"а музыки — {i_rms_db:.1f} dBFS. Похоже, на разделение подан готовый "
+            f"минус или инструментал.")
+        kid.append("Проверять качество разделения не на чем — сравнивать не с чем.")
+        pro.append(f"🎙 Уровень вокала: {v_rms_db:.1f} dBFS (это тишина/шум, не голос)")
+        pro.append(f"🎸 Уровень минуса: {i_rms_db:.1f} dBFS")
+        pro.append(f"   Разница {i_rms_db - v_rms_db:.1f} dB — вокала в миксе нет.")
+        pro.append("")
+        pro.append("📌 ЧТО ДЕЛАТЬ: если нужен вокал — разделяйте ПОЛНЫЙ микс, а не "
+                   "готовый минус. Если проверяли именно минус — отчёт о разделении "
+                   "здесь бессмыслен, смотрите отчёт о качестве звука.")
+        return {"kid": " ".join(kid), "pro": "\n".join(pro),
+                "vocal_present": False}
+
+
+    # Покрытие: если активного вокала в analysed-кадрах почти нет, все метрики
+    # ниже посчитаны на малой выборке — говорим об этом прямо, а не делаем вид,
+    # что анализ всеобъемлющий.
+    coverage_pct = vpi.get("active_coverage_pct")
+    low_coverage = coverage_pct is not None and coverage_pct < ACTIVE_COVERAGE_WARN_PCT
+    if low_coverage:
+        kid.append(f"⚠️ Покрытие низкое ({coverage_pct:.1f}% — "
+                   f"{vpi.get('active_frames_used')} кадров из "
+                   f"{vpi.get('active_frames_total')}). Метрики основаны на малой выборке.")
+        pro.append(f"⚠️ ПОКРЫТИЕ НИЗКОЕ: {coverage_pct:.1f}% "
+                   f"({vpi.get('active_frames_used')} из {vpi.get('active_frames_total')} кадров). "
+                   "Выводы о фазе, наклоне спектра и артефактах ненадёжны.")
+    elif coverage_pct is not None:
+        pro.append(f"📊 Покрытие активного вокала: {coverage_pct:.1f}% "
+                   f"({vpi.get('active_frames_used')} из {vpi.get('active_frames_total')} кадров)")
 
     # Bleed
     if bleed["bleed_pct"] > 20:
@@ -627,12 +767,25 @@ def _make_verdict_v4(v_rms_db, i_rms_db, env_corr, bleed, vpi, phase, tilt,
         kid.append("✅ Вокал в минусе не слышен.")
 
     # VPI
-    if vpi["vpi_db"] > 3.0:
-        kid.append(f"⚠️ Голосовой отпечаток заметен (VPI {vpi['vpi_db']:.1f} dB).")
-    elif vpi["vpi_db"] > 1.5:
-        kid.append(f"🤔 Небольшой отпечаток голоса (VPI {vpi['vpi_db']:.1f} dB).")
+    vpi_db = vpi.get("vpi_db")
+    if vpi_db is None:
+        # Считать было не с чем (мало тихих кадров или опора — ровные нули).
+        # Раньше в этом случае подставлялся 0.0 и выходило «отпечатка нет» —
+        # уверенное утверждение на пустом месте.
+        kid.append("ℹ️ Отпечаток голоса посчитать не удалось: "
+                   f"{vpi.get('vpi_note', 'мало данных')}.")
+        pro.append(f"⚪ VPI: не посчитан ({vpi.get('vpi_note', 'мало данных')})")
+    elif vpi_db > 3.0:
+        kid.append(f"⚠️ Голосовой отпечаток заметен (VPI {vpi_db:.1f} dB).")
+        pro.append(f"🔴 VPI: {vpi_db} dB "
+                   f"(минус в полосе 1–4 кГц: {vpi.get('instrumental_active_band_db')} dB "
+                   f"против {vpi.get('instrumental_quiet_band_db')} dB)")
+    elif vpi_db > 1.5:
+        kid.append(f"🤔 Небольшой отпечаток голоса (VPI {vpi_db:.1f} dB).")
+        pro.append(f"🟡 VPI: {vpi_db} dB")
     else:
-        kid.append(f"✅ Отпечатка нет (VPI {vpi['vpi_db']:.1f} dB).")
+        kid.append(f"✅ Отпечатка нет (VPI {vpi_db:.1f} dB).")
+        pro.append(f"🟢 VPI: OK ({vpi_db} dB)")
 
     # Phase smearing
     if phase["phase_smearing_db"] < -2.0:
@@ -695,22 +848,24 @@ def _make_verdict_v4(v_rms_db, i_rms_db, env_corr, bleed, vpi, phase, tilt,
         pro.append("  1. 🔴 Проблема с транзиентами — попробуй:")
         pro.append("     - BS-Roformer: Gabox 🎸 bleedless v2")
         pro.append("     - BS-Roformer: Becruily 🎤 karaoke")
-        pro.append("  2. Или ослабь Notch в separator_bs.py: INSTR_NOTCH_GAIN_DB = -6.0")
-        pro.append("     (фактическая глубина ≈ -6 dB вместо ≈ -16 dB).")
-        pro.append("     ⚠️ Инверсия параметра: чем БЛИЖЕ значение к 0, тем ГЛУБЖЕ notch")
-        pro.append("     (-1.5 → ≈-16 dB, -6.0 → ≈-6 dB, -10.0 → ≈-3.3 dB).")
+        pro.append("  2. Notch 2.5 кГц по умолчанию выключен (notch_enabled = false в settings.json).")
+        pro.append("     Если включать — INSTR_NOTCH_GAIN_DB_REAL это ЧЕСТНАЯ глубина в дБ:")
+        pro.append("     -3.0 = провал ровно -3 dB на 2.5 кГц.")
 
     if tilt["spectral_tilt_pct"] < -5.0:
         pro.append("  3. 🔴 Минус темнеет — сначала проверь причину:")
-        pro.append("     - в логе строка 'Notch: ... фактическая глубина' ≈ -16 dB?")
-        pro.append("       Тогда виноват Notch, а не LPF → INSTR_NOTCH_GAIN_DB = -6.0")
+        pro.append("     - включён ли notch? в логе есть строка 'Peaking EQ применён'")
+        pro.append("       → ослабь INSTR_NOTCH_GAIN_DB_REAL или выключи notch_enabled")
         pro.append("     - LPF выставлен ниже 19 кГц? → подними до 19 кГц")
-        pro.append("     - или убери LPF совсем, оставь только Notch.")
+        pro.append("     - или убери LPF совсем, оставь только notch.")
 
     if bleed["bleed_pct"] > 20:
         pro.append("  5. 🔴 Высокий bleed — перейди на Becruily 🎤 karaoke.")
 
-    if not real_artifacts and bleed["bleed_pct"] < 5 and vpi["vpi_db"] < 2.0:
+    # «Минус чистый» — только когда VPI реально посчитан. Иначе это был бы вывод
+    # из отсутствия измерения (vpi_db = None).
+    if (not real_artifacts and bleed["bleed_pct"] < 5
+            and vpi.get("vpi_db") is not None and vpi["vpi_db"] < 2.0):
         pro.append("  ✅ Минус чистый. Вмешательство не требуется.")
 
     return {
@@ -823,7 +978,12 @@ def _render_text_v4(r: dict) -> str:
     L.append("🎤 УРОВЕНЬ 6. VPI")
     L.append("─" * 72)
     v = r["level_6_vpi"]
-    L.append(f"  VPI: {v['vpi_db']} dB")
+    if "vpi_db" in v:
+        L.append(f"  VPI: {v['vpi_db']} dB")
+    else:
+        # VPI не считается, когда сравнивать не с чем (см. MIN_REFERENCE_FRAMES).
+        # Печатать вместо числа «0 dB» нельзя: это читалось бы как «отпечатка нет».
+        L.append(f"  VPI: не посчитан — {v.get('vpi_note', 'мало данных')}")
     L.append("")
 
     L.append("─" * 72)

@@ -8,6 +8,11 @@
 # Нужна именно CUDA 12.1: torch 2.5.1+cu121 работает с драйвером NVIDIA
 # от 525.60.13 (Windows). На CPU всё тоже запустится, но в разы медленнее —
 # тогда ставьте обычный torch с PyPI:  pip install torch torchaudio
+#
+# ⚠️ CUDA-рассинхрон: onnxruntime-gpu (из requirements.txt) должен быть собран
+# под ту же мажорную версию CUDA, что и torch. Если версии разъедутся,
+# ONNX-провайдер молча упадёт на CPU, а в логе появится
+# «Failed to load cudart64_13.dll» или похожее. Подробности — в README.
 --extra-index-url https://download.pytorch.org/whl/cu121
 
 torch==2.5.1+cu121

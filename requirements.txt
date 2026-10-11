@@ -1,5 +1,7 @@
-# AST — зависимости проекта.
-# Список снят с рабочего окружения (Python 3.12.10, Windows), версии точные.
+# AST — зависимости проекта (минимальные требования).
+#
+# Точные версии — в requirements.lock.txt (снято через `pip freeze` в рабочем
+# .venv312). Пины в этом файле — минимальные требования, а не эталон.
 #
 #   pip install -r requirements.txt
 #
@@ -11,37 +13,41 @@
 # Без torch приложение не запустится: demucs, torchcrepe и muscriptor работают на нём.
 
 # --- GUI ---
-customtkinter==6.0.0
-pillow==12.3.0
+customtkinter>=5.2,<7
+pillow>=10,<13
 
 # --- Аудио: ввод-вывод и DSP ---
-numpy==2.5.2
-scipy==1.18.1
-soundfile==0.14.0
-sounddevice==0.5.6
+numpy>=1.26,<3
+scipy>=1.11,<2
+soundfile>=0.12,<1
+sounddevice>=0.4,<1
 
 # --- Разделение на стемы ---
-demucs==4.1.0
-audio-separator==0.47.0
-onnxruntime-gpu==1.30.0
+demucs>=4.0,<5
+audio-separator>=0.40,<0.50
+# onnxruntime-gpu должен быть собран под ту же CUDA, что и torch (см. README)
+onnxruntime-gpu>=1.18,<2
 
 # --- Транскрипция в MIDI ---
-torchcrepe==0.0.24
-pretty_midi==0.2.11.post0
+torchcrepe>=0.0.23,<0.1
+pretty_midi>=0.2.10,<0.3
 muscriptor @ git+https://github.com/muscriptor/muscriptor.git@7f213afecf23bd6a1b8672aa223690ee9807cefb
 
 # --- Графики ---
-matplotlib==3.11.2
+matplotlib>=3.8,<4
 
 # --- Утилиты ---
-tqdm==4.70.1
-huggingface_hub==1.32.0
+tqdm>=4.66,<5
+huggingface_hub>=0.23
 
 # ============================================================
 # Чего здесь нет (осознанно):
 #   torch, torchaudio, torchvision — см. requirements-gpu.txt;
 #   basic-pitch  — был в старом requirements.txt, код его не использует
 #                  (транскрипция идёт через torchcrepe);
+#   librosa      — ставится транзитивно (её тянет audio-separator).
+#                  core/transcriber.py использует её для ресемплинга, если есть,
+#                  иначе падает на scipy.signal.resample_poly;
 #   tkinterdnd2  — установлен, но drag & drop в интерфейсе не подключён;
-#   mido, librosa, pydub — стоят как транзитивные зависимости, код их не импортирует.
+#   mido, pydub  — стоят как транзитивные зависимости, код их не импортирует.
 # ============================================================

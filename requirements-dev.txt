@@ -1,0 +1,19 @@
+# AST — зависимости ТОЛЬКО для тестов и бенчмарка.
+#
+# Приложению они не нужны: без этого файла программа работает как обычно.
+# Нужны, чтобы прогнать проверки из папки tests/ и бенчмарк моделей:
+#
+#   .\.venv312\Scripts\python.exe -m pip install -r requirements-dev.txt
+#   .\.venv312\Scripts\python.exe -m pytest tests/ -q
+#   .\.venv312\Scripts\python.exe tools\benchmark.py
+#
+# В requirements.txt их нет сознательно: pytest и метрики не должны попадать
+# в сборку приложения и в рабочий слепок окружения (requirements.lock.txt).
+
+pytest>=8,<10
+
+# Бенчмарк моделей (tools/benchmark.py): SDR / SIR / SAR по эталонным стемам.
+# Если mir_eval не установлен, бенчмарк всё равно работает, но считает
+# упрощённые метрики (и честно об этом пишет в отчёте).
+# mir_eval — чистый Python, тянет только numpy/scipy/decorator (они уже стоят).
+mir_eval>=0.8,<0.9

@@ -11,15 +11,25 @@ from datetime import datetime
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")  # без GUI — только сохранение в файл
+# force=True: анализатор рисует графики в РАБОЧЕМ потоке, поэтому бэкенд обязан
+# быть безголовым. Иначе UI-модуль (ui/components.py) переключит matplotlib на
+# TkAgg, и попытка рисовать из фонового потока полезет в Tk — с предупреждением
+# «Starting a Matplotlib GUI outside of the main thread will likely fail»
+# и риском уронить процесс.
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
+
+from core.utils import to_db
 
 logger = logging.getLogger(__name__)
 
 # Октавные полосы (Гц) — центр каждой
 OCTAVE_BANDS = [63, 125, 250, 500, 1000, 2000, 4000, 8000]
+
+
+_to_db = to_db  # историческое имя: приватная функция, но менять вызовы не будем
 
 
 class AnalysisError(Exception):
@@ -218,12 +228,6 @@ def analyze_audio(
 # ============================================================
 #  Внутренние помощники
 # ============================================================
-
-def _to_db(x: float) -> float:
-    if x <= 1e-10:
-        return -200.0
-    return 20.0 * math.log10(x)
-
 
 def _estimate_f0(mono: np.ndarray, sr: int) -> dict:
     """Грубая оценка основного тона через автокорреляцию по кадрам 100 мс."""
