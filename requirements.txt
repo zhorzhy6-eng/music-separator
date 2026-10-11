@@ -1,25 +1,47 @@
-# GUI
-customtkinter==5.2.2
-tkinterdnd2==0.4.3
-Pillow>=10.0.0
+# AST — зависимости проекта.
+# Список снят с рабочего окружения (Python 3.12.10, Windows), версии точные.
+#
+#   pip install -r requirements.txt
+#
+# ВАЖНО: torch здесь НЕТ. Сборки под CUDA живут не на PyPI, а на отдельном индексе,
+# поэтому они вынесены в requirements-gpu.txt. Поставьте их до или после этого файла:
+#
+#   pip install -r requirements-gpu.txt
+#
+# Без torch приложение не запустится: demucs, torchcrepe и muscriptor работают на нём.
 
-# Audio I/O
-soundfile>=0.12.1
-librosa>=0.10.2
-pydub>=0.25.1
-sounddevice>=0.4.6
-numpy>=1.26
+# --- GUI ---
+customtkinter==6.0.0
+pillow==12.3.0
 
-# Separation
-demucs>=4.0.1
+# --- Аудио: ввод-вывод и DSP ---
+numpy==2.5.2
+scipy==1.18.1
+soundfile==0.14.0
+sounddevice==0.5.6
 
-# Transcription
-basic-pitch>=0.4.0
-pretty_midi>=0.2.10
-mido>=1.3.2
+# --- Разделение на стемы ---
+demucs==4.1.0
+audio-separator==0.47.0
+onnxruntime-gpu==1.30.0
 
-# Visualization
-matplotlib>=3.8
+# --- Транскрипция в MIDI ---
+torchcrepe==0.0.24
+pretty_midi==0.2.11.post0
+muscriptor @ git+https://github.com/muscriptor/muscriptor.git@7f213afecf23bd6a1b8672aa223690ee9807cefb
 
-# Utils
-tqdm>=4.66
+# --- Графики ---
+matplotlib==3.11.2
+
+# --- Утилиты ---
+tqdm==4.70.1
+huggingface_hub==1.32.0
+
+# ============================================================
+# Чего здесь нет (осознанно):
+#   torch, torchaudio, torchvision — см. requirements-gpu.txt;
+#   basic-pitch  — был в старом requirements.txt, код его не использует
+#                  (транскрипция идёт через torchcrepe);
+#   tkinterdnd2  — установлен, но drag & drop в интерфейсе не подключён;
+#   mido, librosa, pydub — стоят как транзитивные зависимости, код их не импортирует.
+# ============================================================

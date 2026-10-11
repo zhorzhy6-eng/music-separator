@@ -40,19 +40,28 @@ python -m venv .venv312
 .\.venv312\Scripts\Activate.ps1
 ```
 
-Дальше — пакеты. Учтите: **`requirements.txt` в репозитории устарел** и не описывает
-рабочее окружение (там лишний `basic-pitch` и нет `torchcrepe`, `scipy`, `muscriptor`,
-`audio-separator`, `beat_this`). Ставьте списком ниже:
+Дальше — зависимости, двумя шагами. Первый файл ставит всё, кроме torch:
 
 ```powershell
-pip install customtkinter pillow soundfile sounddevice numpy scipy matplotlib
-pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install demucs torchcrepe pretty_midi mido muscriptor beat_this
-pip install "audio-separator[gpu]"
+pip install -r requirements.txt
 ```
 
-`audio-separator` даёт `.venv312\Scripts\audio-separator.exe` — именно его вызывает
-приложение для BS-Roformer. Без него движки BS и «Гибрид» работать не будут.
+Второй — сам torch под CUDA 12.1. Он вынесен отдельно, потому что сборки `+cu121`
+живут не на PyPI, а на индексе PyTorch; индекс уже прописан внутри файла:
+
+```powershell
+pip install -r requirements-gpu.txt
+```
+
+Сборка `torch 2.5.1+cu121` требует драйвер NVIDIA от 525.60.13. Если GPU нет,
+поставьте обычный torch с PyPI — на CPU всё работает, но в разы медленнее:
+
+```powershell
+pip install torch torchaudio
+```
+
+Про `audio-separator`: он даёт `.venv312\Scripts\audio-separator.exe` — именно его
+вызывает приложение для BS-Roformer. Без него движки BS и «Гибрид» не работают.
 
 ## Токен Hugging Face
 
@@ -126,12 +135,7 @@ config/settings.json         # пока не используется — нас
 - Отмены долгих задач нет: запущенное разделение из интерфейса не остановить.
 - Лимита параллельных задач нет — несколько прогонов на GPU съедят видеопамять.
 - Автотестов нет.
-- `requirements.txt` не соответствует рабочему окружению.
+- Настройки зашиты в код, `config/settings.json` не используется.
 - Драг-энд-дроп в интерфейсе заявлен, но не подключён.
-
-## Документация
-
-**[PROJECT_SHEET.md](PROJECT_SHEET.md)** — подробный паспорт проекта: архитектура,
-поток данных, все параметры DSP, разбор интерфейса, технический долг и правила
-безопасных правок. Читать до первой правки кода.
+- `tkinterdnd2` установлен, но в коде не применяется.
 

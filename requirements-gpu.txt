@@ -1,0 +1,15 @@
+# AST — GPU-рантайм (CUDA 12.1).
+#
+#   pip install -r requirements-gpu.txt
+#
+# Сборки с суффиксом +cu121 лежат не на PyPI, а на индексе PyTorch, поэтому
+# индекс указан флагом прямо здесь — вручную дописывать --index-url не нужно.
+#
+# Нужна именно CUDA 12.1: torch 2.5.1+cu121 работает с драйвером NVIDIA
+# от 525.60.13 (Windows). На CPU всё тоже запустится, но в разы медленнее —
+# тогда ставьте обычный torch с PyPI:  pip install torch torchaudio
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.5.1+cu121
+torchaudio==2.5.1+cu121
+torchvision==0.20.1+cu121
